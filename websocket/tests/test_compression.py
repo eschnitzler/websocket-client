@@ -402,10 +402,35 @@ class ReceiveTest(unittest.TestCase):
         data += server_compress(
             zlib.compressobj(wbits=-zlib.MAX_WBITS, zdict=b"Hello"), b" Hello world"
         )
-        sock = connected_socket(
-            server_frame(ABNF.OPCODE_TEXT, data, rsv1=1), negotiated()
+        for response in (
+            "permessage-deflate",
+            "permessage-deflate; server_no_context_takeover",
+        ):
+            with self.subTest(response=response):
+                sock = connected_socket(
+                    server_frame(ABNF.OPCODE_TEXT, data, rsv1=1), negotiated(response)
+                )
+                self.assertEqual(sock.recv(), "Hello Hello world")
+
+    def test_server_no_context_takeover_forgets_the_last_message(self):
+        first = zlib.compressobj(wbits=-zlib.MAX_WBITS)
+        data = server_frame(
+            ABNF.OPCODE_TEXT,
+            first.compress(b"Hello") + first.flush(zlib.Z_FINISH),
+            rsv1=1,
         )
-        self.assertEqual(sock.recv(), "Hello Hello world")
+        data += server_frame(
+            ABNF.OPCODE_TEXT,
+            server_compress(
+                zlib.compressobj(wbits=-zlib.MAX_WBITS, zdict=b"Hello"), b"Hello"
+            ),
+            rsv1=1,
+        )
+        sock = connected_socket(
+            data, negotiated("permessage-deflate; server_no_context_takeover")
+        )
+        self.assertEqual(sock.recv(), "Hello")
+        self.assertRaises(WebSocketProtocolException, sock.recv)
 
     def test_final_block_then_a_message_from_the_taken_over_window(self):
         first = zlib.compressobj(wbits=-zlib.MAX_WBITS)

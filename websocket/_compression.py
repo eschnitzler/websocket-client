@@ -318,6 +318,5 @@ class deflate_session:
             raise WebSocketPayloadException(
                 f"Decompressed message exceeds max_message_size ({limit} bytes)"
             )
-        if not self.server_no_context_takeover:
-            self._history = (self._history + result)[-_WINDOW_SIZE:]
+        self._history = (self._history + result)[-_WINDOW_SIZE:]
         return result
