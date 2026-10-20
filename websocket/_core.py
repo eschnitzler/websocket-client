@@ -351,7 +351,10 @@ class WebSocket:
             ABNF.OPCODE_BINARY,
         ):
             return self.send_frame(frame)
-        data = frame.data.encode("utf-8") if isinstance(frame.data, str) else frame.data
+        # create_frame encoded text already; ABNF.mask sends other str payloads as latin-1.
+        data = (
+            frame.data.encode("latin-1") if isinstance(frame.data, str) else frame.data
+        )
         # Compressed messages must reach the socket in the order they were
         # compressed, so both happen under the send lock.
         with self.lock:

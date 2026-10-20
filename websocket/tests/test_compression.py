@@ -1,8 +1,11 @@
 import hashlib
 import struct
+import threading
+import time
 import unittest
 import zlib
 from base64 import encodebytes as base64encode
+from unittest import mock
 
 import websocket as ws
 from websocket._abnf import ABNF
@@ -293,6 +296,35 @@ class HandshakeTest(unittest.TestCase):
     def test_extensions_ignored_without_the_option(self):
         self.assertIsNone(self.do_handshake(["permessage-deflate"]).deflate)
 
+    def connect(self, sock, extensions=None, **options):
+        handshake_sock = SockMock(self.response(extensions))
+        with mock.patch(
+            "websocket._core.connect",
+            return_value=(handshake_sock, ("example.com", 80, "/")),
+        ):
+            sock.connect(
+                "ws://example.com/", header={"Sec-WebSocket-Key": self.KEY}, **options
+            )
+
+    def test_connect_resets_the_session_on_every_handshake(self):
+        sock = ws.WebSocket()
+        self.connect(sock, ["permessage-deflate"], compression=True)
+        self.assertIsInstance(sock.deflate, deflate_session)
+        self.assertTrue(sock.frame_buffer.rsv1_allowed)
+        self.connect(sock, compression=True)
+        self.assertIsNone(sock.deflate)
+        self.assertFalse(sock.frame_buffer.rsv1_allowed)
+
+    def test_connect_with_an_invalid_compression_option(self):
+        for compression in (1, "yes"):
+            with self.subTest(compression=compression):
+                self.assertRaises(
+                    WebSocketException,
+                    self.connect,
+                    ws.WebSocket(),
+                    compression=compression,
+                )
+
 
 class ReceiveTest(unittest.TestCase):
     def session(self, response="permessage-deflate", **settings):
@@ -342,6 +374,22 @@ class ReceiveTest(unittest.TestCase):
         self.assertEqual(sock.recv(), b"plain")
         self.assertEqual(sock.recv(), b"packed")
         self.assertEqual(sock.recv(), b"plain again")
+
+    def test_final_deflate_block_then_context_takeover(self):
+        final = zlib.compressobj(wbits=-zlib.MAX_WBITS)
+        first = final.compress(b"ends the stream") + final.flush(zlib.Z_FINISH)
+        data = server_frame(ABNF.OPCODE_TEXT, first, rsv1=1)
+        compressor = new_compressor()
+        data += server_frame(
+            ABNF.OPCODE_TEXT, server_compress(compressor, b"next"), rsv1=1
+        )
+        data += server_frame(
+            ABNF.OPCODE_TEXT, server_compress(compressor, b"next"), rsv1=1
+        )
+        sock = connected_socket(data, self.session())
+        self.assertEqual(sock.recv(), "ends the stream")
+        self.assertEqual(sock.recv(), "next")
+        self.assertEqual(sock.recv(), "next")
 
     def test_server_no_context_takeover(self):
         data = b""
@@ -487,6 +535,53 @@ class SendTest(unittest.TestCase):
             [(0, ABNF.OPCODE_PING, b"ping"), (0, ABNF.OPCODE_TEXT, b"raw")],
         )
 
+    def test_binary_str_payload_matches_the_uncompressed_bytes(self):
+        sock = connected_socket(
+            session=PerMessageDeflate().accept("permessage-deflate")
+        )
+        sock.send("\xe9", ABNF.OPCODE_BINARY)
+        (_, _, payload) = self.sent_messages(sock)[0]
+        self.assertEqual(
+            zlib.decompressobj(-zlib.MAX_WBITS).decompress(
+                payload + b"\x00\x00\xff\xff"
+            ),
+            b"\xe9",
+        )
+
+    def test_concurrent_sends_reach_the_socket_in_compression_order(self):
+        class SlowSockMock(SockMock):
+            def send(self, data):
+                time.sleep(0.0001)
+                return super().send(data)
+
+        sock = connected_socket(
+            session=PerMessageDeflate().accept("permessage-deflate"),
+            enable_multithread=True,
+        )
+        sock.sock = SlowSockMock()
+
+        def send_many(name):
+            for i in range(200):
+                sock.send(f"{name} message {i} " * 4)
+
+        threads = [threading.Thread(target=send_many, args=(n,)) for n in "ab"]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        decompressor = zlib.decompressobj(-zlib.MAX_WBITS)
+        messages = [
+            decompressor.decompress(payload + b"\x00\x00\xff\xff")
+            for (_, _, payload) in self.sent_messages(sock)
+        ]
+        self.assertEqual(len(messages), 400)
+        for name in "ab":
+            self.assertEqual(
+                [m for m in messages if m.startswith(name.encode())],
+                [(f"{name} message {i} " * 4).encode() for i in range(200)],
+            )
+
     def test_without_the_extension(self):
         sock = connected_socket()
         sock.send("plain")
@@ -494,22 +589,28 @@ class SendTest(unittest.TestCase):
 
 
 class AppTest(unittest.TestCase):
-    def test_compression_is_passed_to_connect(self):
-        options = []
+    def test_compression_is_passed_to_every_connect(self):
+        class ReconnectOnceDispatcher:
+            def __init__(self, app):
+                self.app = app
 
-        def connect(self, url, **kwargs):
-            options.append(kwargs)
-            raise WebSocketException("stop")
+            def reconnect(self, seconds, reconnector):
+                reconnector(reconnecting=True)
+                self.app.keep_running = False
 
-        original = ws.WebSocket.connect
-        ws.WebSocket.connect = connect
-        try:
-            compression = PerMessageDeflate()
-            app = ws.WebSocketApp("ws://example.com", compression=compression)
-            app.run_forever()
-        finally:
-            ws.WebSocket.connect = original
-        self.assertIs(options[0]["compression"], compression)
+        compression = PerMessageDeflate()
+        app = ws.WebSocketApp("ws://example.com", compression=compression)
+        with mock.patch.object(
+            ws.WebSocket, "connect", side_effect=ConnectionRefusedError
+        ) as connect, mock.patch.object(
+            ws.WebSocketApp,
+            "create_dispatcher",
+            return_value=ReconnectOnceDispatcher(app),
+        ):
+            app.run_forever(reconnect=1)
+        self.assertEqual(connect.call_count, 2)
+        for call in connect.call_args_list:
+            self.assertIs(call.kwargs["compression"], compression)
 
 
 if __name__ == "__main__":
