@@ -75,6 +75,14 @@ def new_compressor():
     return zlib.compressobj(wbits=-zlib.MAX_WBITS)
 
 
+def client_decompress(payload, wbits=zlib.MAX_WBITS):
+    return zlib.decompressobj(-wbits).decompress(payload + b"\x00\x00\xff\xff")
+
+
+def negotiated(response="permessage-deflate", **settings):
+    return PerMessageDeflate(**settings).accept(response)
+
+
 def parse_sent(data):
     """Split one masked client frame into (rsv1, opcode, payload)."""
     rsv1 = data[0] >> 6 & 1
@@ -144,7 +152,7 @@ class AcceptTest(unittest.TestCase):
         self.assertIsNone(PerMessageDeflate().accept(""))
 
     def test_accepted(self):
-        session = PerMessageDeflate().accept("permessage-deflate")
+        session = negotiated()
         self.assertIsInstance(session, deflate_session)
         self.assertFalse(session.server_no_context_takeover)
         self.assertFalse(session.client_no_context_takeover)
@@ -185,12 +193,28 @@ class AcceptTest(unittest.TestCase):
             "permessage-deflate; server_max_window_bits=010",
             "permessage-deflate; server_max_window_bits=ten",
             "permessage-deflate; client_max_window_bits",
-            "permessage-deflate; client_max_window_bits=8",
         ):
             with self.subTest(response=response):
                 self.assertRaises(
                     WebSocketException, PerMessageDeflate().accept, response
                 )
+
+    def test_requested_server_parameters_must_be_echoed(self):
+        for settings in (
+            {"server_no_context_takeover": True},
+            {"server_max_window_bits": 10},
+        ):
+            with self.subTest(settings=settings):
+                self.assertRaises(
+                    WebSocketException,
+                    PerMessageDeflate(**settings).accept,
+                    "permessage-deflate",
+                )
+
+    def test_an_8_bit_client_window_disables_sending_compressed(self):
+        session = negotiated("permessage-deflate; client_max_window_bits=8")
+        self.assertFalse(session.compresses)
+        self.assertTrue(negotiated().compresses)
 
     def test_server_window_bits_above_the_offer(self):
         self.assertRaises(
@@ -327,9 +351,6 @@ class HandshakeTest(unittest.TestCase):
 
 
 class ReceiveTest(unittest.TestCase):
-    def session(self, response="permessage-deflate", **settings):
-        return PerMessageDeflate(**settings).accept(response)
-
     def test_messages_share_one_context(self):
         compressor = new_compressor()
         message = b"Hello, Hello, Hello"
@@ -338,7 +359,7 @@ class ReceiveTest(unittest.TestCase):
         )
         second = server_compress(compressor, message)
         data += server_frame(ABNF.OPCODE_TEXT, second, rsv1=1)
-        sock = connected_socket(data, self.session())
+        sock = connected_socket(data, negotiated())
         self.assertEqual(sock.recv(), "Hello, Hello, Hello")
         self.assertEqual(sock.recv(), "Hello, Hello, Hello")
         self.assertLess(len(second), len(message))
@@ -350,7 +371,7 @@ class ReceiveTest(unittest.TestCase):
         data = server_frame(ABNF.OPCODE_BINARY, compressed[:half], fin=0, rsv1=1)
         data += server_frame(ABNF.OPCODE_PING, b"")
         data += server_frame(ABNF.OPCODE_CONT, compressed[half:])
-        sock = connected_socket(data, self.session())
+        sock = connected_socket(data, negotiated())
         self.assertEqual(sock.recv_data(), (ABNF.OPCODE_BINARY, message))
 
     def test_fire_cont_frame_receives_each_fragment_decompressed(self):
@@ -358,7 +379,7 @@ class ReceiveTest(unittest.TestCase):
         compressed = server_compress(new_compressor(), message)
         data = server_frame(ABNF.OPCODE_BINARY, compressed[:5], fin=0, rsv1=1)
         data += server_frame(ABNF.OPCODE_CONT, compressed[5:])
-        sock = connected_socket(data, self.session(), fire_cont_frame=True)
+        sock = connected_socket(data, negotiated(), fire_cont_frame=True)
         _, first = sock.recv_data_frame()
         _, second = sock.recv_data_frame()
         self.assertEqual(first.data + second.data, message)
@@ -370,26 +391,39 @@ class ReceiveTest(unittest.TestCase):
             ABNF.OPCODE_BINARY, server_compress(compressor, b"packed"), rsv1=1
         )
         data += server_frame(ABNF.OPCODE_BINARY, b"plain again")
-        sock = connected_socket(data, self.session())
+        sock = connected_socket(data, negotiated())
         self.assertEqual(sock.recv(), b"plain")
         self.assertEqual(sock.recv(), b"packed")
         self.assertEqual(sock.recv(), b"plain again")
 
-    def test_final_deflate_block_then_context_takeover(self):
-        final = zlib.compressobj(wbits=-zlib.MAX_WBITS)
-        first = final.compress(b"ends the stream") + final.flush(zlib.Z_FINISH)
-        data = server_frame(ABNF.OPCODE_TEXT, first, rsv1=1)
-        compressor = new_compressor()
-        data += server_frame(
-            ABNF.OPCODE_TEXT, server_compress(compressor, b"next"), rsv1=1
+    def test_blocks_after_a_final_block_in_one_message(self):
+        first = zlib.compressobj(wbits=-zlib.MAX_WBITS)
+        data = first.compress(b"Hello") + first.flush(zlib.Z_FINISH)
+        data += server_compress(
+            zlib.compressobj(wbits=-zlib.MAX_WBITS, zdict=b"Hello"), b" Hello world"
         )
-        data += server_frame(
-            ABNF.OPCODE_TEXT, server_compress(compressor, b"next"), rsv1=1
+        sock = connected_socket(
+            server_frame(ABNF.OPCODE_TEXT, data, rsv1=1), negotiated()
         )
-        sock = connected_socket(data, self.session())
-        self.assertEqual(sock.recv(), "ends the stream")
-        self.assertEqual(sock.recv(), "next")
-        self.assertEqual(sock.recv(), "next")
+        self.assertEqual(sock.recv(), "Hello Hello world")
+
+    def test_final_block_then_a_message_from_the_taken_over_window(self):
+        first = zlib.compressobj(wbits=-zlib.MAX_WBITS)
+        data = server_frame(
+            ABNF.OPCODE_TEXT,
+            first.compress(b"ends the stream") + first.flush(zlib.Z_FINISH),
+            rsv1=1,
+        )
+        compressor = zlib.compressobj(wbits=-zlib.MAX_WBITS, zdict=b"ends the stream")
+        for _ in range(2):
+            data += server_frame(
+                ABNF.OPCODE_TEXT,
+                server_compress(compressor, b"ends the stream"),
+                rsv1=1,
+            )
+        sock = connected_socket(data, negotiated())
+        for _ in range(3):
+            self.assertEqual(sock.recv(), "ends the stream")
 
     def test_server_no_context_takeover(self):
         data = b""
@@ -398,7 +432,7 @@ class ReceiveTest(unittest.TestCase):
                 ABNF.OPCODE_TEXT, server_compress(new_compressor(), b"same"), rsv1=1
             )
         sock = connected_socket(
-            data, self.session("permessage-deflate; server_no_context_takeover")
+            data, negotiated("permessage-deflate; server_no_context_takeover")
         )
         self.assertEqual(sock.recv(), "same")
         self.assertEqual(sock.recv(), "same")
@@ -407,12 +441,12 @@ class ReceiveTest(unittest.TestCase):
         compressed = server_compress(new_compressor(), b"split message")
         data = server_frame(ABNF.OPCODE_TEXT, compressed[:3], fin=0, rsv1=1)
         data += server_frame(ABNF.OPCODE_CONT, compressed[3:], rsv1=1)
-        sock = connected_socket(data, self.session())
+        sock = connected_socket(data, negotiated())
         self.assertRaises(WebSocketProtocolException, sock.recv)
 
     def test_rsv1_on_a_control_frame(self):
         sock = connected_socket(
-            server_frame(ABNF.OPCODE_PING, b"", rsv1=1), self.session()
+            server_frame(ABNF.OPCODE_PING, b"", rsv1=1), negotiated()
         )
         self.assertRaises(WebSocketProtocolException, sock.recv)
 
@@ -427,26 +461,37 @@ class ReceiveTest(unittest.TestCase):
         data = server_frame(
             ABNF.OPCODE_TEXT, server_compress(new_compressor(), b"\xffbad"), rsv1=1
         )
-        sock = connected_socket(data, self.session())
+        sock = connected_socket(data, negotiated())
         self.assertRaises(WebSocketPayloadException, sock.recv)
 
     def test_invalid_compressed_data(self):
         data = server_frame(ABNF.OPCODE_BINARY, b"\xff\xff\xff\xff", rsv1=1)
-        sock = connected_socket(data, self.session())
+        sock = connected_socket(data, negotiated())
         self.assertRaises(WebSocketProtocolException, sock.recv)
 
     def test_max_message_size(self):
         data = server_frame(
             ABNF.OPCODE_BINARY, server_compress(new_compressor(), b"y" * 101), rsv1=1
         )
-        sock = connected_socket(data, self.session(max_message_size=100))
+        sock = connected_socket(data, negotiated(max_message_size=100))
         self.assertRaises(WebSocketPayloadException, sock.recv)
+
+    def test_an_error_resets_the_decompressor(self):
+        data = server_frame(
+            ABNF.OPCODE_BINARY, server_compress(new_compressor(), b"y" * 101), rsv1=1
+        )
+        data += server_frame(
+            ABNF.OPCODE_BINARY, server_compress(new_compressor(), b"fresh"), rsv1=1
+        )
+        sock = connected_socket(data, negotiated(max_message_size=100))
+        self.assertRaises(WebSocketPayloadException, sock.recv)
+        self.assertEqual(sock.recv(), b"fresh")
 
     def test_max_message_size_counts_every_fragment(self):
         compressed = server_compress(new_compressor(), b"z" * 101)
         data = server_frame(ABNF.OPCODE_BINARY, compressed[:2], fin=0, rsv1=1)
         data += server_frame(ABNF.OPCODE_CONT, compressed[2:])
-        sock = connected_socket(data, self.session(max_message_size=100))
+        sock = connected_socket(data, negotiated(max_message_size=100))
         self.assertRaises(WebSocketPayloadException, sock.recv)
 
     def test_no_max_message_size(self):
@@ -454,7 +499,7 @@ class ReceiveTest(unittest.TestCase):
         compressed = server_compress(new_compressor(), message)
         sock = connected_socket(
             server_frame(ABNF.OPCODE_BINARY, compressed, rsv1=1),
-            self.session(max_message_size=None),
+            negotiated(max_message_size=None),
         )
         self.assertEqual(sock.recv(), message)
 
@@ -464,9 +509,7 @@ class SendTest(unittest.TestCase):
         return [parse_sent(data) for data in sock.sock.sent]
 
     def test_messages_are_compressed_with_one_context(self):
-        sock = connected_socket(
-            session=PerMessageDeflate().accept("permessage-deflate")
-        )
+        sock = connected_socket(session=negotiated())
         sock.send("Hello, Hello, Hello")
         sock.send("Hello, Hello, Hello")
         decompressor = zlib.decompressobj(-zlib.MAX_WBITS)
@@ -481,53 +524,33 @@ class SendTest(unittest.TestCase):
 
     def test_client_no_context_takeover(self):
         sock = connected_socket(
-            session=PerMessageDeflate().accept(
-                "permessage-deflate; client_no_context_takeover"
-            )
+            session=negotiated("permessage-deflate; client_no_context_takeover")
         )
         sock.send_binary(b"Hello, Hello, Hello")
         sock.send_binary(b"Hello, Hello, Hello")
         (_, _, first), (_, op, second) = self.sent_messages(sock)
         self.assertEqual(op, ABNF.OPCODE_BINARY)
         self.assertEqual(first, second)
-        self.assertEqual(
-            zlib.decompressobj(-zlib.MAX_WBITS).decompress(
-                second + b"\x00\x00\xff\xff"
-            ),
-            b"Hello, Hello, Hello",
-        )
+        self.assertEqual(client_decompress(second), b"Hello, Hello, Hello")
 
     def test_client_window_bits(self):
         sock = connected_socket(
-            session=PerMessageDeflate().accept(
-                "permessage-deflate; client_max_window_bits=9"
-            )
+            session=negotiated("permessage-deflate; client_max_window_bits=9")
         )
         message = bytes(range(256)) * 8
         sock.send_binary(message)
         (_, _, payload) = self.sent_messages(sock)[0]
-        self.assertEqual(
-            zlib.decompressobj(-9).decompress(payload + b"\x00\x00\xff\xff"), message
-        )
+        self.assertEqual(client_decompress(payload, wbits=9), message)
 
     def test_empty_message(self):
-        sock = connected_socket(
-            session=PerMessageDeflate().accept("permessage-deflate")
-        )
+        sock = connected_socket(session=negotiated())
         sock.send("")
         (rsv1, _, payload) = self.sent_messages(sock)[0]
         self.assertEqual(rsv1, 1)
-        self.assertEqual(
-            zlib.decompressobj(-zlib.MAX_WBITS).decompress(
-                payload + b"\x00\x00\xff\xff"
-            ),
-            b"",
-        )
+        self.assertEqual(client_decompress(payload), b"")
 
     def test_control_frames_and_raw_frames_are_not_compressed(self):
-        sock = connected_socket(
-            session=PerMessageDeflate().accept("permessage-deflate")
-        )
+        sock = connected_socket(session=negotiated())
         sock.ping("ping")
         sock.send_frame(ABNF.create_frame("raw", ABNF.OPCODE_TEXT))
         self.assertEqual(
@@ -536,17 +559,10 @@ class SendTest(unittest.TestCase):
         )
 
     def test_binary_str_payload_matches_the_uncompressed_bytes(self):
-        sock = connected_socket(
-            session=PerMessageDeflate().accept("permessage-deflate")
-        )
+        sock = connected_socket(session=negotiated())
         sock.send("\xe9", ABNF.OPCODE_BINARY)
         (_, _, payload) = self.sent_messages(sock)[0]
-        self.assertEqual(
-            zlib.decompressobj(-zlib.MAX_WBITS).decompress(
-                payload + b"\x00\x00\xff\xff"
-            ),
-            b"\xe9",
-        )
+        self.assertEqual(client_decompress(payload), b"\xe9")
 
     def test_concurrent_sends_reach_the_socket_in_compression_order(self):
         class SlowSockMock(SockMock):
@@ -555,7 +571,7 @@ class SendTest(unittest.TestCase):
                 return super().send(data)
 
         sock = connected_socket(
-            session=PerMessageDeflate().accept("permessage-deflate"),
+            session=negotiated(),
             enable_multithread=True,
         )
         sock.sock = SlowSockMock()
@@ -581,6 +597,16 @@ class SendTest(unittest.TestCase):
                 [m for m in messages if m.startswith(name.encode())],
                 [(f"{name} message {i} " * 4).encode() for i in range(200)],
             )
+
+    def test_an_8_bit_client_window_sends_uncompressed(self):
+        compressed = server_compress(new_compressor(), b"packed")
+        sock = connected_socket(
+            server_frame(ABNF.OPCODE_BINARY, compressed, rsv1=1),
+            negotiated("permessage-deflate; client_max_window_bits=8"),
+        )
+        sock.send("plain")
+        self.assertEqual(self.sent_messages(sock), [(0, ABNF.OPCODE_TEXT, b"plain")])
+        self.assertEqual(sock.recv(), b"packed")
 
     def test_without_the_extension(self):
         sock = connected_socket()

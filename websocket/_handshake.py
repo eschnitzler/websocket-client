@@ -76,6 +76,7 @@ def handshake(
     resource: str,
     **options: Any,
 ) -> handshake_response:
+    options["compression"] = _compression(options)
     headers, key = _get_handshake_headers(resource, url, hostname, port, options)
 
     header_str = "\r\n".join(headers)
@@ -90,7 +91,7 @@ def handshake(
         raise WebSocketException("Invalid WebSocket Header")
 
     deflate = None
-    if compression := _compression(options):
+    if compression := options["compression"]:
         deflate = compression.accept(resp.get("sec-websocket-extensions"))
 
     return handshake_response(status, resp, subproto, deflate)

@@ -346,9 +346,10 @@ class WebSocket:
         """
 
         frame = ABNF.create_frame(payload, opcode)
-        if self.deflate is None or opcode not in (
-            ABNF.OPCODE_TEXT,
-            ABNF.OPCODE_BINARY,
+        if (
+            self.deflate is None
+            or not self.deflate.compresses
+            or opcode not in (ABNF.OPCODE_TEXT, ABNF.OPCODE_BINARY)
         ):
             return self.send_frame(frame)
         # create_frame encoded text already; ABNF.mask sends other str payloads as latin-1.
@@ -752,6 +753,9 @@ def create_connection(
         Skip utf8 validation.
     socket: socket
         Pre-initialized stream socket.
+    compression: bool or PerMessageDeflate
+        Offer the permessage-deflate extension (RFC 7692). True offers it
+        with the default settings. Default is None, which offers nothing.
     """
     sockopt = options.pop("sockopt", [])
     sslopt = options.pop("sslopt", {})

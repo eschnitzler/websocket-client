@@ -38,6 +38,7 @@ _MIN_WINDOW_BITS = 8
 # zlib cannot compress with an 8 bit window, so the client's own window is 9 to 15.
 _MIN_CLIENT_WINDOW_BITS = 9
 _MAX_WINDOW_BITS = 15
+_WINDOW_SIZE = 1 << _MAX_WINDOW_BITS
 
 
 class PerMessageDeflate:
@@ -127,7 +128,7 @@ class PerMessageDeflate:
         """
         if response is None or not response.strip():
             return None
-        extensions = [e.strip() for e in response.split(",")]
+        extensions = response.split(",")
         if len(extensions) != 1:
             raise WebSocketException(
                 f"Server accepted more than one extension: {response!r}"
@@ -174,14 +175,18 @@ class PerMessageDeflate:
                     raise WebSocketException(
                         "Server sent client_max_window_bits, which was not offered"
                     )
-                bits = _window_bits(key, value)
-                if bits < _MIN_CLIENT_WINDOW_BITS:
-                    raise WebSocketException(
-                        f"client_max_window_bits={bits} is not supported by zlib"
-                    )
-                client_window_bits = min(client_window_bits, bits)
+                client_window_bits = min(client_window_bits, _window_bits(key, value))
             else:
                 raise WebSocketException(f"Unknown extension parameter: {key!r}")
+
+        # A server accepts these requests by echoing them (RFC 7692 section 7.1).
+        if self.server_no_context_takeover and not server_no_context_takeover:
+            raise WebSocketException("Server did not accept server_no_context_takeover")
+        if (
+            self.server_max_window_bits is not None
+            and "server_max_window_bits" not in params
+        ):
+            raise WebSocketException("Server did not accept server_max_window_bits")
 
         return deflate_session(
             server_no_context_takeover=server_no_context_takeover,
@@ -219,7 +224,9 @@ class deflate_session:
     The negotiated permessage-deflate state of one connection.
 
     ``compress`` must be called in the order messages are written to the
-    socket, and ``decompress`` in the order frames are read.
+    socket, and ``decompress`` in the order frames are read. When the server
+    limits the client to an 8 bit window, which zlib cannot compress with,
+    ``compresses`` is False and messages are sent uncompressed.
     """
 
     def __init__(
@@ -235,7 +242,12 @@ class deflate_session:
         self.client_window_bits = client_window_bits
         self.compress_level = compress_level
         self.max_message_size = max_message_size
-        self._compressor = self._new_compressor()
+        self.compresses = client_window_bits >= _MIN_CLIENT_WINDOW_BITS
+        if self.compresses:
+            self._compressor = self._new_compressor()
+        # The last window of decompressed output, which the server may refer
+        # back to after it ends a DEFLATE stream with a final block.
+        self._history = b""
         self._decompressor = self._new_decompressor()
         self._receiving_compressed = False
         self._received_size = 0
@@ -247,7 +259,7 @@ class deflate_session:
 
     def _new_decompressor(self) -> "zlib._Decompress":
         # A full window reads data compressed with any smaller one (RFC 7692 section 7.2.2).
-        return zlib.decompressobj(-_MAX_WINDOW_BITS)
+        return zlib.decompressobj(-_MAX_WINDOW_BITS, zdict=self._history)
 
     def compress(self, data: bytes) -> bytes:
         """Compress one whole message (RFC 7692 section 7.2.1)."""
@@ -269,16 +281,34 @@ class deflate_session:
         """Decompress one frame of the current received message, if it is compressed."""
         if not self._receiving_compressed:
             return data
-        if fin:
-            data += _EMPTY_BLOCK_TAIL
-        limit = self.max_message_size
         try:
-            if limit is None:
-                result = self._decompressor.decompress(data)
-            else:
-                result = self._decompressor.decompress(
-                    data, limit - self._received_size + 1
-                )
+            result = self._inflate(data)
+            # A message may go on after a block with BFINAL set (RFC 7692 section 7.2.1).
+            while self._decompressor.eof and self._decompressor.unused_data:
+                rest = self._decompressor.unused_data
+                self._decompressor = self._new_decompressor()
+                result += self._inflate(rest)
+            # The tail ends the sender's last block, so a stream ended by BFINAL takes none.
+            if fin and not self._decompressor.eof:
+                result += self._inflate(_EMPTY_BLOCK_TAIL)
+        except Exception:
+            self._history = b""
+            self._decompressor = self._new_decompressor()
+            self._receiving_compressed = False
+            raise
+        if fin and self.server_no_context_takeover:
+            self._history = b""
+            self._decompressor = self._new_decompressor()
+        elif fin and self._decompressor.eof:
+            self._decompressor = self._new_decompressor()
+        return result
+
+    def _inflate(self, data: bytes) -> bytes:
+        limit = self.max_message_size
+        # A max_length of 0 tells zlib to decompress without a limit.
+        max_length = 0 if limit is None else limit - self._received_size + 1
+        try:
+            result = self._decompressor.decompress(data, max_length)
         except zlib.error as e:
             raise WebSocketProtocolException(f"Invalid compressed data: {e}") from e
         self._received_size += len(result)
@@ -288,6 +318,6 @@ class deflate_session:
             raise WebSocketPayloadException(
                 f"Decompressed message exceeds max_message_size ({limit} bytes)"
             )
-        if fin and (self.server_no_context_takeover or self._decompressor.eof):
-            self._decompressor = self._new_decompressor()
+        if not self.server_no_context_takeover:
+            self._history = (self._history + result)[-_WINDOW_SIZE:]
         return result
