@@ -17,6 +17,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import sys
 import zlib
 from typing import Optional, Union
 
@@ -94,8 +95,12 @@ class PerMessageDeflate:
             )
         if not -1 <= compress_level <= 9:
             raise ValueError("compress_level must be -1 to 9")
-        if max_message_size is not None and max_message_size < 0:
-            raise ValueError("max_message_size must not be negative")
+        if max_message_size is not None and (
+            not isinstance(max_message_size, int)
+            or isinstance(max_message_size, bool)
+            or max_message_size < 0
+        ):
+            raise ValueError("max_message_size must be None or an int of at least 0")
         self.client_no_context_takeover = client_no_context_takeover
         self.server_no_context_takeover = server_no_context_takeover
         self.client_max_window_bits = client_max_window_bits
@@ -306,7 +311,9 @@ class deflate_session:
     def _inflate(self, data: bytes) -> bytes:
         limit = self.max_message_size
         # A max_length of 0 tells zlib to decompress without a limit.
-        max_length = 0 if limit is None else limit - self._received_size + 1
+        max_length = (
+            0 if limit is None else min(limit - self._received_size + 1, sys.maxsize)
+        )
         try:
             result = self._decompressor.decompress(data, max_length)
         except zlib.error as e:
@@ -318,5 +325,8 @@ class deflate_session:
             raise WebSocketPayloadException(
                 f"Decompressed message exceeds max_message_size ({limit} bytes)"
             )
-        self._history = (self._history + result)[-_WINDOW_SIZE:]
+        if len(result) >= _WINDOW_SIZE:
+            self._history = result[-_WINDOW_SIZE:]
+        else:
+            self._history = (self._history + result)[-_WINDOW_SIZE:]
         return result

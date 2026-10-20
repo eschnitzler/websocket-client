@@ -1,5 +1,6 @@
 import hashlib
 import struct
+import sys
 import threading
 import time
 import unittest
@@ -141,6 +142,8 @@ class OfferTest(unittest.TestCase):
             {"server_max_window_bits": 16},
             {"compress_level": 10},
             {"max_message_size": -1},
+            {"max_message_size": 1e6},
+            {"max_message_size": True},
         ):
             with self.subTest(kwargs=kwargs):
                 self.assertRaises(ValueError, PerMessageDeflate, **kwargs)
@@ -518,6 +521,14 @@ class ReceiveTest(unittest.TestCase):
         data += server_frame(ABNF.OPCODE_CONT, compressed[2:])
         sock = connected_socket(data, negotiated(max_message_size=100))
         self.assertRaises(WebSocketPayloadException, sock.recv)
+
+    def test_max_message_size_larger_than_zlib_takes(self):
+        compressed = server_compress(new_compressor(), b"big limit")
+        sock = connected_socket(
+            server_frame(ABNF.OPCODE_BINARY, compressed, rsv1=1),
+            negotiated(max_message_size=sys.maxsize * 2),
+        )
+        self.assertEqual(sock.recv(), b"big limit")
 
     def test_no_max_message_size(self):
         message = b"q" * 100000
