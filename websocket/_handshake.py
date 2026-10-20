@@ -26,6 +26,7 @@ from http import HTTPStatus
 from http.cookies import CookieError
 from typing import Any, List, Optional
 
+from ._compression import PerMessageDeflate, deflate_session
 from ._cookiejar import SimpleCookieJar
 from ._exceptions import WebSocketException, WebSocketBadStatusException
 from ._http import read_headers
@@ -50,10 +51,17 @@ CookieJar = SimpleCookieJar()
 
 
 class handshake_response:
-    def __init__(self, status: int, headers: dict, subprotocol: Optional[str]) -> None:
+    def __init__(
+        self,
+        status: int,
+        headers: dict,
+        subprotocol: Optional[str],
+        deflate: Optional[deflate_session] = None,
+    ) -> None:
         self.status = status
         self.headers = headers
         self.subprotocol = subprotocol
+        self.deflate = deflate
         try:
             CookieJar.add(headers.get("set-cookie"))
         except CookieError:
@@ -68,6 +76,7 @@ def handshake(
     resource: str,
     **options: Any,
 ) -> handshake_response:
+    options["compression"] = _compression(options)
     headers, key = _get_handshake_headers(resource, url, hostname, port, options)
 
     header_str = "\r\n".join(headers)
@@ -81,7 +90,24 @@ def handshake(
     if not success:
         raise WebSocketException("Invalid WebSocket Header")
 
-    return handshake_response(status, resp, subproto)
+    deflate = None
+    if compression := options["compression"]:
+        deflate = compression.accept(resp.get("sec-websocket-extensions"))
+
+    return handshake_response(status, resp, subproto, deflate)
+
+
+def _compression(options: dict) -> Optional[PerMessageDeflate]:
+    compression = options.get("compression")
+    if compression is True:
+        return PerMessageDeflate()
+    if not compression:
+        return None
+    if not isinstance(compression, PerMessageDeflate):
+        raise WebSocketException(
+            f"compression must be a bool or PerMessageDeflate, not {type(compression).__name__}"
+        )
+    return compression
 
 
 def _pack_hostname(hostname: str) -> str:
@@ -139,6 +165,13 @@ def _get_handshake_headers(
         if isinstance(header, dict):
             header = [": ".join([k, v]) for k, v in header.items() if v is not None]
         headers.extend(header)
+
+    if compression := _compression(options):
+        if any(h.lower().startswith("sec-websocket-extensions:") for h in headers):
+            raise WebSocketException(
+                "Pass either the compression option or a Sec-WebSocket-Extensions header, not both"
+            )
+        headers.append(f"Sec-WebSocket-Extensions: {compression.offer()}")
 
     server_cookie = CookieJar.get(host)
     client_cookie = options.get("cookie", None)
